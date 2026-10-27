@@ -1,0 +1,319 @@
+"""
+Integration checks for the Swift module, using real SwiftPM packages.
+"""
+type E2e {
+  let assert(ok: Boolean!, message: String!): Void {
+    if (ok == false) { raise message }
+    null
+  }
+
+  let run(check: Check!): Void {
+    if (check.pass == false) { raise check.error.message ?? "check failed" }
+    null
+  }
+
+  let failure(check: Check!): String! {
+    { run(check); "unexpected success" } rescue {
+      err: Error => err.message
+    }
+  }
+
+  # Fixtures live in code so the module's own workspace contains no test packages
+  # for automatic discovery, especially the deliberately broken ones.
+  let fixture: Directory! {
+    directory
+      .withNewFile("Package.swift", """
+        // swift-tools-version: 5.9
+        import PackageDescription
+        let package = Package(
+            name: "Signals",
+            platforms: [.iOS(.v15), .macOS(.v13)],
+            products: [.library(name: "Signals", targets: ["Signals"])],
+            targets: [
+                .target(name: "Signals"),
+                .testTarget(name: "SignalsTests", dependencies: ["Signals"]),
+            ]
+        )
+      """)
+      .withNewFile("Sources/Signals/Signals.swift", "public func answer() -> Int { 42 }\n")
+      .withNewFile("Tests/SignalsTests/SignalsTests.swift", """
+        import XCTest
+        @testable import Signals
+        final class SignalsTests: XCTestCase {
+            func testAnswer() { XCTAssertEqual(answer(), 42) }
+        }
+      """)
+  }
+
+  """
+  Package roots, nesting, cwd scoping, and generated dependency exclusions.
+  """
+  discovery: Void @check {
+    let tree = fixture
+      .withDirectory("apps/one", fixture)
+      .withDirectory("apps/two", fixture)
+      .withDirectory(".build/checkouts/dependency", fixture)
+      .withDirectory("apps/one/.build/checkouts/dependency", fixture)
+      .withDirectory("node_modules/dependency", fixture)
+      .withDirectory("DerivedData/dependency", fixture)
+      .withNewFile(".gitignore", "ignored/\n")
+      .withDirectory("ignored", fixture)
+    let ws = tree.asWorkspace
+    assert(
+      swift.packages(ws).keys == [".", "apps/one", "apps/two"],
+      "incorrect root discovery: " + swift.packages(ws).keys.join(", "),
+    )
+    assert(swift.packages(ws.withWorkdir("apps/one")).keys == ["apps/one"], "nested root leaked siblings")
+    assert(
+      swift.packages(ws.withWorkdir("apps/one/Sources")).keys == ["apps/one"],
+      "enclosing package not found",
+    )
+    assert(
+      swift.packages(ws.withWorkdir("apps")).keys == [".", "apps/one", "apps/two"],
+      "ancestor path was not normalized",
+    )
+    assert(
+      swift.package(ws.withWorkdir("apps/one"), "../two").path == "apps/two",
+      "relative lookup failed",
+    )
+    assert(swift.package(ws, "apps/one/../two").path == "apps/two", "internal parent path failed")
+    let escape = { swift.package(ws, "../outside").path } rescue "rejected"
+    assert(escape == "rejected", "package path escaped workspace")
+    let empty = directory.withNewFile("README.md", "No Swift packages").asWorkspace
+    assert(swift.packages(empty).keys == [], "empty workspace discovered packages")
+    swift.packages(empty).batch.test(empty)
+    null
+  }
+
+  """
+  The default image builds and tests XCTest and Swift Testing packages for Linux.
+  """
+  buildAndTest: Void @check {
+    let ws = fixture.withNewFile("Tests/SignalsTests/ModernTests.swift", """
+      import Testing
+      @testable import Signals
+      @Test func modernAnswer() { #expect(answer() == 42) }
+    """).asWorkspace
+    let package = swift.package(ws, ".")
+    run(package.build(ws))
+    run(package.tests(ws).batch.test(ws))
+    null
+  }
+
+  """
+  Selections isolate siblings; batch failures identify every failing package.
+  """
+  selectionAndFailures: Void @check {
+    let broken = fixture.withNewFile("Tests/SignalsTests/SignalsTests.swift", """
+      import XCTest
+      final class SignalsTests: XCTestCase {
+          func testFailure() { XCTFail("intentional test failure") }
+      }
+    """)
+    let ws = directory
+      .withDirectory("passing", fixture)
+      .withDirectory("failing-a", broken)
+      .withDirectory("failing-b", broken)
+      .asWorkspace
+    let packages = swift.packages(ws)
+    assert(packages.get(key: "passing").path == "passing", "collection get failed")
+    packages.subset(keys: ["passing"]).batch.test(ws)
+    packages.subset(keys: []).batch.test(ws)
+    let error = { packages.batch.test(ws); "unexpected success" } rescue {
+      err: Error => err.message
+    }
+    assert(error.contains("failing-a") and error.contains("failing-b"), "batch lost failures: " + error)
+    assert(error.contains("intentional test failure"), "test diagnostic was lost: " + error)
+    assert(error.contains("- passing:") == false, "passing package reported as failed")
+    let invalid = fixture.withNewFile("Sources/Signals/Signals.swift", "this is not Swift\n").asWorkspace
+    let compileError = failure(swift.package(invalid, ".").build(invalid))
+    assert(compileError.contains("swift build failed"), "invalid Swift compiled: " + compileError)
+    null
+  }
+
+  """
+  Local package dependencies and fixtures retain their workspace-relative paths.
+  """
+  localDependencies: Void @check {
+    let app = directory
+      .withNewFile("Package.swift", """
+        // swift-tools-version: 5.9
+        import PackageDescription
+        let package = Package(
+            name: "App",
+            dependencies: [.package(path: "../shared")],
+            targets: [
+                .testTarget(name: "AppTests", dependencies: [
+                    .product(name: "Signals", package: "shared")
+                ]),
+            ]
+        )
+      """)
+      .withNewFile("Tests/AppTests/AppTests.swift", """
+        import Foundation
+        import XCTest
+        import Signals
+        final class AppTests: XCTestCase {
+            func testShared() throws {
+                XCTAssertEqual(answer(), 42)
+                let text = try String(contentsOfFile: "../../testdata/expected.txt", encoding: .utf8)
+                XCTAssertEqual(text, "42")
+            }
+        }
+      """)
+    let ws = directory
+      .withDirectory("packages/app", app)
+      .withDirectory("packages/shared", fixture)
+      .withNewFile("testdata/expected.txt", "42")
+      .asWorkspace(cwd: "packages/app")
+    let tool = swift(includeExtraFiles: ["packages/shared/**", "testdata/**"])
+    run(tool.package(ws, ".").tests(ws).batch.test(ws))
+    null
+  }
+
+  """
+  Image overrides, build/test flags, environment values, and source exclusions.
+  """
+  settings: Void @check {
+    let ws = fixture
+      .withNewFile(".build/host-output", "must not be imported")
+      .withNewFile(".swiftpm/configuration/marker", "keep SwiftPM configuration")
+      .withNewFile(".gitignore", "ignored.txt\n")
+      .withNewFile("ignored.txt", "must not be imported")
+      .withNewFile("Tests/SignalsTests/SignalsTests.swift", """
+        import Foundation
+        import XCTest
+        @testable import Signals
+        final class SignalsTests: XCTestCase {
+            func testSelected() { XCTAssertEqual(ProcessInfo.processInfo.environment["MESSAGE"], "hello=world with spaces") }
+            func testSkipped() { XCTFail("filter was ignored") }
+        }
+      """)
+      .asWorkspace
+    let tool = swift(
+      baseImageAddress: "swift:6.0-noble",
+      buildFlags: ["--configuration", "release"],
+      testFlags: ["--filter", "SignalsTests.testSelected"],
+      environment: ["MESSAGE=hello=world with spaces"],
+    )
+    let package = tool.package(ws, ".")
+    let files = package.source(ws).glob("**/*")
+    assert(files.contains(".build/host-output") == false, "host build output imported")
+    assert(files.contains("ignored.txt") == false, "gitignored file imported")
+    assert(files.contains(".swiftpm/configuration/marker"), "SwiftPM configuration excluded")
+    run(package.build(ws))
+    run(package.tests(ws).batch.test(ws))
+    # The custom container must take precedence over an invalid image setting.
+    let prepared = swift(
+      baseImageAddress: "invalid.invalid/should-not-be-pulled",
+      base: container.from("swift:6.0-noble").withEnvVariable("CUSTOM_BASE", "yes"),
+    ).package(ws, ".").container(ws)
+    assert(
+      prepared.withExec(["printenv", "CUSTOM_BASE"]).stdout.trim("\n") == "yes",
+      "custom base was lost",
+    )
+    let bad = swift(environment: ["NO_EQUALS"]).package(ws, ".")
+    let invalid = { bad.test(ws); "unexpected success" } rescue {
+      err: Error => err.message
+    }
+    assert(invalid.contains("KEY=VALUE"), "invalid environment accepted")
+    null
+  }
+
+  let selectable: Directory! {
+    fixture
+      .withNewFile("Tests/SignalsTests/SignalsTests.swift", """
+        import XCTest
+        final class SignalsTests: XCTestCase {
+            func testPass() { XCTAssertEqual(2 + 2, 4) }
+            func testPassExtra() { XCTFail("XCTest sibling must not run") }
+        }
+      """)
+      .withNewFile("Tests/SignalsTests/ModernTests.swift", """
+        import Testing
+        @Test func modern() { #expect(2 + 2 == 4) }
+        @Test func modernExtra() { Issue.record("Swift Testing sibling must not run") }
+        @Test(arguments: [1, 2]) func parameters(value: Int) { #expect(value > 0) }
+        @Suite struct Nested {
+            @Test func nested() { #expect(2 + 2 == 4) }
+        }
+        #if EXTRA_TEST
+        @Test func conditional() { #expect(2 + 2 == 4) }
+        #endif
+      """)
+  }
+
+  """
+  Discover both frameworks and run exact test selections without prefix matches.
+  """
+  testCollection: Void @check {
+    let ws = selectable.asWorkspace
+    let tests = swift.package(ws, ".").tests(ws)
+    assert(
+      tests.keys == [
+        "SignalsTests.Nested/nested()",
+        "SignalsTests.SignalsTests/testPass",
+        "SignalsTests.SignalsTests/testPassExtra",
+        "SignalsTests.modern()",
+        "SignalsTests.modernExtra()",
+        "SignalsTests.parameters(value:)",
+      ],
+      "unexpected identifiers: " + tests.keys.join(", "),
+    )
+    assert(
+      tests.get(key: "SignalsTests.modern()").name == "SignalsTests.modern()",
+      "get lost identifier",
+    )
+    run(tests.get(key: "SignalsTests.SignalsTests/testPass").test(ws))
+    run(tests.get(key: "SignalsTests.modern()").test(ws))
+    run(
+      tests.subset(keys: ["SignalsTests.Nested/nested()", "SignalsTests.parameters(value:)", "SignalsTests.modern()"]).batch.test(ws),
+    )
+    run(tests.subset(keys: []).batch.test(ws))
+    assert(failure(tests.batch.test(ws)).contains("sibling must not run"), "whole suite hid failures")
+    assert(
+      failure(tests.get(key: "SignalsTests.SignalsTests/testPassExtra").test(ws)).contains("XCTest sibling"),
+      "selected failing test passed",
+    )
+    assert(
+      failure(tests.get(key: "SignalsTests.modernExtra()").test(ws)).contains("Swift Testing sibling"),
+      "selected Swift Testing function did not run",
+    )
+    let invalid = fixture.withNewFile("Sources/Signals/Signals.swift", "not valid Swift\n").asWorkspace
+    let error = { swift.package(invalid, ".").tests(invalid).keys.join(",") } rescue {
+      err: Error => err.message
+    }
+    assert(error.contains("swift test list failed"), "discovery hid compiler failure: " + error)
+    null
+  }
+
+  """
+  Discovery preserves compilation flags; explicit selection replaces broad filters.
+  """
+  testCollectionSettings: Void @check {
+    let ws = selectable.asWorkspace
+    let tests = swift(
+      testFlags: [
+        "--configuration", "release", "-Xswiftc", "-DEXTRA_TEST",
+        "--parallel", "--num-workers=2", "--filter", "testPass", "--filter=modern",
+      ],
+    ).package(ws, ".").tests(ws)
+    assert(tests.keys.contains("SignalsTests.conditional()"), "discovery lost compilation flags")
+    run(
+      tests.subset(keys: ["SignalsTests.SignalsTests/testPass", "SignalsTests.modern()"]).batch.test(ws),
+    )
+    let wsParameters = selectable.withNewFile(
+      "Tests/SignalsTests/ModernTests.swift",
+      """
+        import Testing
+        @Test(arguments: [1, 2]) func parameters(value: Int) { #expect(value == 1) }
+      """,
+    ).asWorkspace
+    let selected = swift.package(wsParameters, ".").tests(wsParameters).get(key: "SignalsTests.parameters(value:)")
+    assert(
+      failure(selected.test(wsParameters)).contains("Expectation failed"),
+      "parameter cases were skipped",
+    )
+    null
+  }
+}

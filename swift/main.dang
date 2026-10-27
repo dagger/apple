@@ -1,0 +1,340 @@
+"""
+Build and test cross-platform Swift packages in Linux containers.
+"""
+type Swift {
+  """
+  The Swift toolchain image.
+  """
+  baseImageAddress: String! = "swift:6.0-noble"
+
+  """
+  Optional container with Swift and additional system dependencies installed.
+  """
+  base: Container
+
+  """
+  Arguments appended to swift build, for example ["--configuration", "release"].
+  """
+  buildFlags: [String!]! = []
+
+  """
+  Arguments appended to swift test, for example ["--filter", "SignalsTests"].
+  """
+  testFlags: [String!]! = []
+
+  """
+  Environment variables for builds and tests, as KEY=VALUE.
+  """
+  environment: [String!]! = []
+
+  """
+  Workspace-root include patterns mounted alongside each package at their original
+  relative paths. Use for local package dependencies and shared test fixtures.
+  """
+  includeExtraFiles: [String!]! = []
+
+  """
+  Swift packages visible from the working directory, keyed by workspace-relative root.
+  """
+  packages(ws: Workspace!): SwiftPackages! {
+    # findRoots does not apply gitignore rules itself. Filter against a single
+    # manifest-only snapshot so ignored packages cannot become broken checks.
+    let manifests = ws.directory(
+      "/",
+      include: ["**/Package.swift"],
+      exclude: excludes,
+      gitignore: true,
+    ).glob("**/Package.swift")
+    SwiftPackages(
+      paths: sorted(
+        ws
+          .findRoots(
+            markers: ["Package.swift"],
+            exclude: ["**/.build/**", "**/node_modules/**", "**/DerivedData/**"],
+          )
+          .map { path => workspacePath(ws, path) }
+          .filter { path => manifests.contains(if (path == ".") { "Package.swift" } else { path + "/Package.swift" }) }
+          .uniq,
+      ),
+      tool: self,
+    )
+  }
+
+  """
+  Select a package by a path relative to the working directory.
+  """
+  package(ws: Workspace!, path: String!): SwiftPackage! {
+    SwiftPackage(path: workspacePath(ws, path), tool: self)
+  }
+
+  # Collection keys remain relative to the workspace root even from a nested cwd.
+  let workspacePath(ws: Workspace!, path: String!): String! {
+    if (path.hasPrefix("/")) { raise "Package paths must be relative to the working directory" }
+    let empty: [String!]! = []
+    let segments = (ws.cwd.split("/") + path.split("/"))
+      .filter { part => part != "" and part != "." }
+      .reduce(empty) { acc, part =>
+        if (part == "..") {
+          if (acc.length == 0) { raise "Package path leaves the workspace" }
+          acc.dropLast(1)
+        } else {
+          acc + [part]
+        }
+      }
+    if (segments.length == 0) { "." } else { segments.join("/") }
+  }
+
+  let sorted(paths: [String!]!): [String!]! {
+    let empty: [String!]! = []
+    paths.reduce(empty) { acc, path =>
+      acc.takeWhile { item => item <= path } + [path] + acc.dropWhile { item => item <= path }
+    }
+  }
+
+  let excludes: [String!]! = ["**/.git", "**/.build", "**/node_modules", "**/DerivedData", "**/xcuserdata"]
+
+  let runner(ws: Workspace!, package: SwiftPackage!): Container! {
+    let workdir = if (package.path == ".") { "/src" } else { "/src/" + package.path }
+    let ctr = (base ?? container.from(baseImageAddress))
+      .withDirectory(workdir, package.source(ws))
+      .withWorkdir(workdir)
+    let withExtras = if (includeExtraFiles.length == 0) { ctr } else {
+      ctr.withDirectory(
+        "/src",
+        ws.directory("/", include: includeExtraFiles, exclude: excludes, gitignore: true),
+      )
+    }
+    environment.reduce(withExtras) { acc, pair =>
+      let key = pair.split("=")[0] ?? ""
+      if (pair.contains("=") == false or key == "") {
+        raise "Environment variables must be KEY=VALUE: " + pair
+      }
+      acc.withEnvVariable(key, pair.trimPrefix(key + "="))
+    }
+  }
+
+  let failure(ws: Workspace!, package: SwiftPackage!, command: String!): String {
+    {
+      let flags = if (command == "test") { testFlags } else { buildFlags }
+      let ran = runner(ws, package)
+        .withExec(["swift", command] + flags, expect: ReturnType.ANY)
+      commandFailure(ran, "swift " + command)
+    } rescue {
+      err: Error => err.message
+    }
+  }
+
+  let commandFailure(ran: Container!, command: String!): String {
+    if (ran.exitCode == 0) { null } else {
+      command + " failed (exit " + toString(ran.exitCode) + "):\n"
+        + "stdout:\n" + ran.stdout.trim(" \n").split("\n").takeLast(30).join("\n")
+        + "\nstderr:\n" + ran.stderr.trim(" \n").split("\n").takeLast(30).join("\n")
+    }
+  }
+
+  # Strip only named options, including their values, without splitting arguments
+  # containing spaces. Both --option=value and --option value are accepted.
+  let withoutOptions(args: [String!]!, values: [String!]!, switches: [String!]!): [String!]! {
+    let empty: [String!]! = []
+    args.reduce({{skipNext: false, args: empty}}) { state, arg =>
+      let name = arg.split("=")[0] ?? ""
+      if (state.skipNext) {
+        {{skipNext: false, args: state.args}}
+      } else if (values.contains(name)) {
+        {{skipNext: arg.contains("=") == false, args: state.args}}
+      } else if (switches.contains(name)) {
+        {{skipNext: false, args: state.args}}
+      } else {
+        {{skipNext: false, args: state.args + [arg]}}
+      }
+    }.args
+  }
+
+  # `swift test list` accepts build and framework options, but not run-only
+  # options such as --parallel, --filter, or --xunit-output.
+  let discoveryFlags: [String!]! {
+    withoutOptions(
+      testFlags,
+      ["--filter", "--skip", "--specifier", "-s", "--num-workers", "--xunit-output", "--test-output"],
+      [
+        "--parallel", "--no-parallel", "--enable-code-coverage", "--disable-code-coverage",
+        "--enable-testable-imports", "--disable-testable-imports",
+      ],
+    )
+  }
+
+  let exactFilter(names: [String!]!): String! {
+    let special = ["\\", ".", "^", "$", "|", "?", "*", "+", "(", ")", "[", "]", "{", "}"]
+    # Swift Testing filters include a /file:line:column suffix that `list`
+    # omits for unambiguous names. Match that boundary as well as end-of-ID.
+    "^(" + names.map { name =>
+      name.split("").map { char => if (special.contains(char)) { "\\" + char } else { char } }.join("")
+    }.join("|") + ")(/|$)"
+  }
+}
+
+"""
+Swift packages keyed by their workspace-relative roots.
+"""
+type SwiftPackages @collection {
+  paths: [String!]! @keys
+  let tool: Swift!
+
+  """
+  The package at a workspace-relative root.
+  """
+  package(path: String!): SwiftPackage! @get {
+    SwiftPackage(path: path, tool: tool)
+  }
+
+  """
+  Build the selected packages.
+  """
+  build(ws: Workspace!): Void @check {
+    run(ws, "build")
+  }
+
+  """
+  Run the selected packages' tests.
+  """
+  test(ws: Workspace!): Void {
+    run(ws, "test")
+  }
+
+  let run(ws: Workspace!, command: String!): Void {
+    # Selection evaluates packages concurrently and collects every failure.
+    let failures = paths.map { path => package(path) }.{{path, failure(ws, command)}}
+      .filter { result => result.failure != null }
+    if (failures.length > 0) {
+      raise "Swift package " + command + " failed:\n" + failures.map { result =>
+        "- " + result.path + ": " + (result.failure ?? "")
+      }.join("\n")
+    }
+    null
+  }
+}
+
+"""
+A Swift package rooted at a workspace-relative path.
+"""
+type SwiftPackage {
+  path: String!
+  let tool: Swift!
+
+  """
+  Package source, excluding host build products and gitignored files.
+  """
+  source(ws: Workspace!): Directory! {
+    ws.directory(
+      if (path == ".") { "/" } else { "/" + path },
+      exclude: tool.excludes,
+      gitignore: true,
+    )
+  }
+
+  """
+  A Swift container with the package mounted and its working directory set.
+  """
+  container(ws: Workspace!): Container! {
+    tool.runner(ws, self)
+  }
+
+  """
+  Discover test identifiers with swift test list. This compiles the test targets.
+  Parameterized Swift Testing functions are one item, running all their cases.
+  """
+  tests(ws: Workspace!): SwiftTests! {
+    let listed = discovered(ws)
+    let names = tool.sorted(listed.stdout.split("\n").map { name => name.trim("\r") }.filter { name => name != "" }.uniq)
+    SwiftTests(names: names, allNames: names, package: self)
+  }
+
+  let discovered(ws: Workspace!): Container! {
+    let listed = container(ws)
+      .withExec(["swift", "test", "list"] + tool.discoveryFlags, expect: ReturnType.ANY)
+    let error = tool.commandFailure(listed, "swift test list")
+    if (error != null) { raise "Swift package " + path + ": " + (error ?? "") }
+    listed
+  }
+
+  """
+  Compile this package for Linux with swift build.
+  """
+  build(ws: Workspace!): Void @check {
+    run(ws, "build")
+  }
+
+  """
+  Run this package's XCTest and Swift Testing tests with swift test.
+  """
+  test(ws: Workspace!): Void {
+    run(ws, "test")
+  }
+
+  let failure(ws: Workspace!, command: String!): String {
+    tool.failure(ws, self, command)
+  }
+
+  let run(ws: Workspace!, command: String!): Void {
+    let error = failure(ws, command)
+    if (error != null) { raise "Swift package " + path + ": " + (error ?? "") }
+    null
+  }
+}
+
+"""
+Tests in a Swift package, keyed by the identifiers reported by SwiftPM.
+"""
+type SwiftTests @collection {
+  names: [String!]! @keys
+  let allNames: [String!]!
+  let package: SwiftPackage!
+
+  """
+  The test with this SwiftPM identifier.
+  """
+  testCase(name: String!): SwiftTest! @get {
+    SwiftTest(name: name, suite: self)
+  }
+
+  """
+  Run selected tests together. A narrowed selection overrides testFlags' filter
+  or specifier; skip flags still apply. An empty selection runs nothing.
+  """
+  test(ws: Workspace!): Void @check {
+    run(ws, names, names != allNames)
+  }
+
+  let run(ws: Workspace!, selected: [String!]!, filtered: Boolean!): Void {
+    if (selected.length > 0) {
+      let tool = package.tool
+      let flags = if (filtered) {
+        tool.withoutOptions(tool.testFlags, ["--filter", "--specifier", "-s"], [])
+          + ["--filter", tool.exactFilter(selected)]
+      } else {
+        tool.testFlags
+      }
+      # Reuse discovery's compiled artifacts. SwiftPM still checks whether the
+      # execution flags require rebuilding (for example, code coverage).
+      let ran = package.discovered(ws).withExec(["swift", "test"] + flags, expect: ReturnType.ANY)
+      let error = tool.commandFailure(ran, "swift test")
+      if (error != null) { raise "Swift package " + package.path + ": " + (error ?? "") }
+    }
+    null
+  }
+}
+
+"""
+A test function in a Swift package.
+"""
+type SwiftTest {
+  name: String!
+  let suite: SwiftTests!
+
+  """
+  Run this test, or all cases of this parameterized test function.
+  """
+  test(ws: Workspace!): Void @check {
+    suite.run(ws, [name], true)
+  }
+}

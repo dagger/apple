@@ -1,0 +1,19 @@
+[modules.swift]
+source = "swift"
+
+[modules.e2e]
+source = ".dagger/modules/e2e"
+
+[modules.dagger-dang-sdk]
+source = "github.com/dagger/dang-sdk"
+
+[sdks.dang]
+module = "dagger-dang-sdk"
+
+[sdks.dang.scopes."swift"]
+is-module = true
+name = "swift"
+
+[sdks.dang.scopes.".dagger/modules/e2e"]
+clients = ["./swift"]
+is-module = true
