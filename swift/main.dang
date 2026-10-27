@@ -34,17 +34,34 @@ type Swift {
   includeExtraFiles: [String!]! = []
 
   """
+  Workspace-relative package directory paths or globs to discover. Empty includes all packages.
+  """
+  packageInclude: [String!]! = []
+
+  """
+  Workspace-relative package directory paths or globs to exclude from discovery. Exclusions win.
+  """
+  packageExclude: [String!]! = []
+
+  """
   Swift packages visible from the working directory, keyed by workspace-relative root.
   """
   packages(ws: Workspace!): SwiftPackages! {
     # findRoots does not apply gitignore rules itself. Filter against a single
     # manifest-only snapshot so ignored packages cannot become broken checks.
-    let manifests = ws.directory(
+    let snapshot = ws.directory(
       "/",
       include: ["**/Package.swift"],
       exclude: excludes,
       gitignore: true,
-    ).glob("**/Package.swift")
+    )
+    let included = if (packageInclude.length == 0) {
+      snapshot.glob("**/Package.swift")
+    } else {
+      matchingManifests(snapshot, packageInclude)
+    }
+    let excluded = matchingManifests(snapshot, packageExclude)
+    let manifests = included.filter { path => excluded.contains(path) == false }
     SwiftPackages(
       paths: sorted(
         ws
@@ -58,6 +75,17 @@ type Swift {
       ),
       tool: self,
     )
+  }
+
+  # Append the marker so globs match complete package directories, not source
+  # files or path prefixes. Use Dagger's glob semantics on the same root snapshot
+  # regardless of cwd, and retain its gitignore and generated-directory exclusions.
+  let matchingManifests(snapshot: Directory!, patterns: [String!]!): [String!]! {
+    let empty: [String!]! = []
+    patterns.reduce(empty) { acc, pattern =>
+      let path = pattern.trimPrefix("./").trimSuffix("/")
+      acc + snapshot.glob(if (path == "." or path == "") { "Package.swift" } else { path + "/Package.swift" })
+    }.uniq
   }
 
   """

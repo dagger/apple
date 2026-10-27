@@ -57,6 +57,45 @@ configuration is retained unless gitignored. Host `.build` contents are excluded
 so macOS build products cannot contaminate Linux builds. Dagger caches container
 execution; the module does not share a mutable `.build` cache across packages.
 
+Use `packageInclude` and `packageExclude` to narrow automatic discovery, for
+example when an iOS shell cannot resolve or compile on Linux:
+
+```toml
+[modules.swift.settings]
+packageInclude = ["mobile/ios/App/HealthSignals"]
+```
+
+Alternatively, discover every visible package except the shell:
+
+```toml
+[modules.swift.settings]
+packageExclude = ["mobile/ios/App/CapApp-SPM"]
+```
+
+Patterns match workspace-relative **package directories**, not `Package.swift`
+filenames. Exact paths select only that package; `.` selects a root package.
+Dagger globs are supported: `*` matches within a path segment, `?` matches one
+character, and `**` spans directories. For example:
+
+```toml
+[modules.swift.settings]
+packageInclude = ["Packages/**"]
+packageExclude = ["Packages/AppleOnly/**"]
+```
+
+An empty include list includes all discovered packages. Exclusions apply after
+includes and always win. Patterns remain relative to the workspace root from
+nested working directories; they do not broaden the normal discovery scope or
+restore gitignored or generated packages.
+
+These settings apply to package listing and automatic build and test checks.
+Excluded packages never reach `swift build`, `swift test list`, or `swift test`
+through discovery. Selecting an excluded or nonexistent package with
+`--swift-package` fails with no checks selected. The explicit `package(ws, path)`
+API remains available regardless of these filters. Filters do not prevent an
+included package from resolving its own dependencies; use `includeExtraFiles`
+when those dependencies need additional workspace files.
+
 Each selected package runs in its own container. Batch checks report all failing
 packages with the last 30 lines of stdout and stderr. Full command output is available
 in the Dagger trace.
@@ -114,6 +153,8 @@ includeExtraFiles = ["Packages/Shared/**", "mobile/testdata/**"]
 | `testFlags` | `[]` | Arguments appended to `swift test`, such as `--filter`. |
 | `environment` | `[]` | Environment variables as `KEY=VALUE`; spaces and additional `=` are preserved. |
 | `includeExtraFiles` | `[]` | Workspace-root patterns for local dependencies and test fixtures. |
+| `packageInclude` | `[]` | Workspace-relative package directory paths or globs; empty includes all discovered packages. |
+| `packageExclude` | `[]` | Package directory paths or globs removed after inclusion; empty excludes none. |
 
 The package mounts at `/src/<workspace-relative-path>` and is the working
 directory. Extra files mount under `/src` at their original workspace-relative
@@ -173,3 +214,5 @@ Swift Testing, local dependencies, shared fixtures, flags, environment variables
 custom base containers, and exclusion of host build products. Test collection
 checks cover exact selection, similarly named tests, parameterized functions,
 compilation flags, configured filters, empty selections, and discovery errors.
+Package filter checks cover exact paths, globs, exclusion precedence, nested
+working directories, and unresolvable dependencies.

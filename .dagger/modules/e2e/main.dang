@@ -86,6 +86,134 @@ type E2e {
   }
 
   """
+  Package filters use workspace-relative directories and only narrow discovery.
+  """
+  packageFilters: Void @check {
+    let ws = fixture
+      .withDirectory("Packages/Signals", fixture)
+      .withDirectory("Packages/SignalsExtra", fixture)
+      .withDirectory("Packages/AppleOnly", fixture)
+      .withDirectory("Packages/AppleOnly/Nested", fixture)
+      .withDirectory("mobile/ios/App/HealthSignals", fixture)
+      .withDirectory(".build/checkouts/dependency", fixture)
+      .withDirectory("Packages/Signals/node_modules/dependency", fixture)
+      .withDirectory("DerivedData/dependency", fixture)
+      .withDirectory("Packages/Ignored", fixture)
+      .withNewFile(".gitignore", "Packages/Ignored/\n")
+      .asWorkspace
+    let all = [".", "Packages/AppleOnly", "Packages/AppleOnly/Nested", "Packages/Signals", "Packages/SignalsExtra", "mobile/ios/App/HealthSignals"]
+    assert(swift.packages(ws).keys == all, "default discovery changed")
+    assert(
+      swift(packageInclude: [], packageExclude: []).packages(ws).keys == all,
+      "empty filters changed discovery",
+    )
+    let exact = swift(packageInclude: ["Packages/Signals", "mobile/ios/App/HealthSignals"])
+    assert(
+      exact.packages(ws).keys == ["Packages/Signals", "mobile/ios/App/HealthSignals"],
+      "exact include matched a prefix",
+    )
+    assert(
+      swift(packageInclude: ["Packages/Signals/Package.swift"]).packages(ws).keys == [],
+      "include matched a manifest filename",
+    )
+    assert(swift(packageInclude: ["missing"]).packages(ws).keys == [], "unmatched include discovered packages")
+    assert(swift(packageInclude: ["."]).packages(ws).keys == ["."], "root include failed")
+    assert(swift(packageExclude: ["."]).packages(ws).keys == all.dropFirst(1), "root exclusion removed descendants")
+    assert(
+      swift(packageInclude: ["Packages/*"]).packages(ws).keys == ["Packages/AppleOnly", "Packages/Signals", "Packages/SignalsExtra"],
+      "single wildcard crossed directory boundaries",
+    )
+    assert(
+      swift(packageInclude: ["./Packages/Signals/"]).packages(ws).keys == ["Packages/Signals"],
+      "relative prefix or trailing slash changed matching",
+    )
+    let globbed = swift(packageInclude: ["Packages/**"], packageExclude: ["Packages/AppleOnly/**"])
+    assert(
+      globbed.packages(ws).keys == ["Packages/Signals", "Packages/SignalsExtra"],
+      "recursive glob or exclusion precedence failed",
+    )
+    assert(
+      swift(packageInclude: ["Packages/Signal?", "Packages/Signals*"], packageExclude: ["Packages/SignalsExtra"]).packages(ws).keys == ["Packages/Signals"],
+      "wildcard matching or deduplication failed",
+    )
+    assert(
+      swift(packageExclude: ["Packages/AppleOnly"]).packages(ws).keys.contains("Packages/AppleOnly/Nested"),
+      "exact exclusion removed a nested package",
+    )
+    assert(
+      swift(packageInclude: ["Packages/Signals"], packageExclude: ["Packages/Signals"]).packages(ws).keys == [],
+      "exact exclusion did not win",
+    )
+    assert(swift(packageInclude: ["**"]).packages(ws).keys == all, "glob restored generated or gitignored packages")
+    assert(
+      swift(packageInclude: ["Packages/Ignored", ".build/checkouts/dependency", "DerivedData/dependency", "Packages/Signals/node_modules/dependency"]).packages(ws).keys == [],
+      "explicit includes restored excluded packages",
+    )
+    assert(
+      exact.packages(ws.withWorkdir("Packages/Signals")).keys == ["Packages/Signals"],
+      "nested cwd changed matching or included siblings",
+    )
+    assert(
+      exact.packages(ws.withWorkdir("Packages/Signals/Sources")).keys == ["Packages/Signals"],
+      "enclosing package match changed",
+    )
+    assert(
+      globbed.packages(ws.withWorkdir("Packages")).keys == ["Packages/Signals", "Packages/SignalsExtra"],
+      "nested glob matching changed",
+    )
+    assert(
+      globbed.packages(ws.withWorkdir("Packages/AppleOnly/Sources")).keys == [],
+      "nested cwd bypassed exclusion",
+    )
+    assert(
+      globbed.package(ws, "Packages/AppleOnly").path == "Packages/AppleOnly",
+      "filters blocked explicit package API",
+    )
+    null
+  }
+
+  """
+  Excluded packages with unresolvable dependencies never reach Swift commands.
+  """
+  filteredChecks: Void @check {
+    let broken = fixture.withNewFile("Package.swift", """
+      // swift-tools-version: 5.9
+      import PackageDescription
+      let package = Package(
+          name: "Signals",
+          dependencies: [.package(url: "file:///missing-swift-dependency", from: "1.0.0")],
+          targets: [.target(name: "Signals")]
+      )
+    """)
+    let ws = directory
+      .withDirectory("mobile/ios/App/HealthSignals", fixture)
+      .withDirectory("mobile/ios/App/CapApp-SPM", broken)
+      .asWorkspace
+    let tool = swift(packageExclude: ["mobile/ios/App/CapApp-SPM"])
+    let packages = tool.packages(ws)
+    assert(packages.keys == ["mobile/ios/App/HealthSignals"], "excluded package was listed")
+    run(packages.batch.build(ws))
+    run(
+      packages.get(key: "mobile/ios/App/HealthSignals").tests(ws).batch.test(ws),
+    )
+    packages.batch.test(ws)
+    let included = swift(packageInclude: ["mobile/ios/App/HealthSignals"]).packages(ws)
+    assert(included.keys == packages.keys, "explicit inclusion did not isolate the valid package")
+    run(included.batch.build(ws))
+    run(
+      included.get(key: "mobile/ios/App/HealthSignals").tests(ws).batch.test(ws),
+    )
+    included.batch.test(ws)
+    let explicit = tool.package(ws, "mobile/ios/App/CapApp-SPM")
+    assert(failure(explicit.build(ws)).contains("missing-swift-dependency"), "explicit API did not attempt dependency resolution")
+    let error = { explicit.tests(ws).keys.join(","); "unexpected success" } rescue {
+      err: Error => err.message
+    }
+    assert(error.contains("missing-swift-dependency"), "broken fixture did not fail test discovery")
+    null
+  }
+
+  """
   The default image builds and tests XCTest and Swift Testing packages for Linux.
   """
   buildAndTest: Void @check {
