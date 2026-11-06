@@ -112,14 +112,101 @@ type Swift {
     if (segments.length == 0) { "." } else { segments.join("/") }
   }
 
-  let sorted(paths: [String!]!): [String!]! {
-    let empty: [String!]! = []
-    paths.reduce(empty) { acc, path =>
-      acc.takeWhile { item => item <= path } + [path] + acc.dropWhile { item => item <= path }
+  # Byte order, matching the indexer's result ranks. Merge sort keeps the
+  # per-check work O(n log n): every test check sorts its package's selection.
+  let sorted(items: [String!]!): [String!]! {
+    if (items.length < 2) {
+      items
+    } else {
+      let half = items.length / 2
+      mergeSorted(sorted(items.takeFirst(half)), sorted(items.dropFirst(half)))
+    }
+  }
+
+  let mergeSorted(a: [String!]!, b: [String!]!): [String!]! {
+    let i = 0
+    let j = 0
+    (a + b).map { unused =>
+      if (j == b.length or (i < a.length and a[i]! <= b[j]!)) {
+        let item = a[i]!
+        i += 1
+        item
+      } else {
+        let item = b[j]!
+        j += 1
+        item
+      }
     }
   }
 
   let excludes: [String!]! = ["**/.git", "**/.build", "**/node_modules", "**/DerivedData", "**/xcuserdata"]
+
+  # The pinned image the helper is built and the scan runs in.
+  let helperImage: String! = "golang:1.27.3-alpine"
+
+  # The module's helper (helpers/swift-tests): `scan` lists tests from source
+  # and `report` splits a shared swift test run into per-check results. A
+  # static binary built once in a pinned image, so it runs in any base
+  # container and is identical for every check.
+  let helper: File! {
+    container
+      .from(helperImage)
+      .withEnvVariable("CGO_ENABLED", "0")
+      .withEnvVariable("GOTOOLCHAIN", "local")
+      .withDirectory("/helpers/swift-tests", currentModule.source.directory("helpers/swift-tests"))
+      .withWorkdir("/helpers/swift-tests")
+      .withExec(["go", "build", "-trimpath", "-o", "/usr/local/bin/swift-tests", "."])
+      .file("/usr/local/bin/swift-tests")
+  }
+
+  # Compilation conditions test discovery evaluates #if blocks with: -D flags
+  # passed through -Xswiftc in testFlags, and DEBUG unless the configuration
+  # is release, as SwiftPM sets them.
+  let compilationConditions: [String!]! {
+    let empty: [String!]! = []
+    let state = testFlags.reduce({{previous: "", names: empty, release: false}}) { acc, arg =>
+      let define = acc.previous == "-Xswiftc" and arg.hasPrefix("-D") and arg != "-D"
+      let release = ((acc.previous == "-c" or acc.previous == "--configuration") and arg == "release")
+        or arg == "--configuration=release"
+        or arg == "-c=release"
+      {{
+        previous: arg,
+        names: if (define) { acc.names + [arg.trimPrefix("-D")] } else { acc.names },
+        release: acc.release or release
+      }}
+    }
+    sorted((state.names + (if (state.release) { empty } else { ["DEBUG"] })).uniq)
+  }
+
+  # One source-only scan of every package's tests in the workspace. It runs no
+  # SwiftPM, resolves no dependencies and compiles nothing, in a pinned image
+  # whose inputs are the workspace's Swift files and the compilation
+  # conditions, so every package reads its slice of the same result.
+  let discovery(ws: Workspace!): Directory! {
+    container
+      .from(helperImage)
+      .withFile("/usr/local/bin/swift-tests", helper)
+      .withMountedDirectory(
+        "/ws",
+        ws.directory("/", include: ["**/*.swift"], exclude: excludes, gitignore: true),
+      )
+      .withExec(["swift-tests", "scan", "--root", "/ws", "--output", "/discovery"]
+        + compilationConditions.map { name => "--define=" + name })
+      .directory("/discovery")
+  }
+
+  # A package's discovered tests and the file discovery could not read, if any.
+  let discoveredTests(ws: Workspace!, path: String!): {{tests: [String!]!, error: String!}}! {
+    let scanned = discovery(ws)
+    let roots = JSON.decode(scanned.file("roots.json").contents) :: [String!]!
+    if (roots.contains(path)) {
+      let rank = roots.filter { root => root < path }.length
+      JSON.decode(scanned.file("packages/" + toString(rank) + ".json").contents) :: {{tests: [String!]!, error: String!}}!
+    } else {
+      let empty: [String!]! = []
+      {{tests: empty, error: path + "/Package.swift: not found"}}
+    }
+  }
 
   let runner(ws: Workspace!, package: SwiftPackage!): Container! {
     let workdir = if (package.path == ".") { "/src" } else { "/src/" + package.path }
@@ -178,23 +265,10 @@ type Swift {
     }.args
   }
 
-  # `swift test list` accepts build and framework options, but not run-only
-  # options such as --parallel, --filter, or --xunit-output.
-  let discoveryFlags: [String!]! {
-    withoutOptions(
-      testFlags,
-      ["--filter", "--skip", "--specifier", "-s", "--num-workers", "--xunit-output", "--test-output"],
-      [
-        "--parallel", "--no-parallel", "--enable-code-coverage", "--disable-code-coverage",
-        "--enable-testable-imports", "--disable-testable-imports",
-      ],
-    )
-  }
-
   let exactFilter(names: [String!]!): String! {
     let special = ["\\", ".", "^", "$", "|", "?", "*", "+", "(", ")", "[", "]", "{", "}"]
-    # Swift Testing filters include a /file:line:column suffix that `list`
-    # omits for unambiguous names. Match that boundary as well as end-of-ID.
+    # Swift Testing IDs end in a /file:line:column suffix that discovery omits.
+    # Match that boundary as well as end-of-ID.
     "^(" + names.map { name =>
       name.split("").map { char => if (special.contains(char)) { "\\" + char } else { char } }.join("")
     }.join("|") + ")(/|$)"
@@ -216,14 +290,15 @@ type SwiftPackages @collection {
   }
 
   """
-  Build the selected packages.
+  Build the selected packages. A plain helper: each package's build check
+  already runs during dagger check.
   """
-  build(ws: Workspace!): Void @check {
+  build(ws: Workspace!): Void {
     run(ws, "build")
   }
 
   """
-  Run the selected packages' tests.
+  Run the selected packages' tests, one swift test per package.
   """
   test(ws: Workspace!): Void {
     run(ws, "test")
@@ -268,27 +343,31 @@ type SwiftPackage {
   }
 
   """
-  Discover test identifiers with swift test list. This compiles the test targets.
-  Parameterized Swift Testing functions are one item, running all their cases.
+  Test identifiers, discovered from source the way swift test list names them,
+  without running SwiftPM or compiling. Parameterized Swift Testing functions
+  are one item, running all their cases.
   """
   tests(ws: Workspace!): SwiftTests! {
-    let listed = discovered(ws)
-    let names = tool.sorted(listed.stdout.split("\n").map { name => name.trim("\r") }.filter { name => name != "" }.uniq)
-    SwiftTests(names: names, allNames: names, package: self)
+    SwiftTests(names: tool.sorted(tool.discoveredTests(ws, path).tests.uniq), package: self)
   }
 
-  let discovered(ws: Workspace!): Container! {
-    let listed = container(ws)
-      .withExec(["swift", "test", "list"] + tool.discoveryFlags, expect: ReturnType.ANY)
-    let error = tool.commandFailure(listed, "swift test list")
-    if (error != null) { raise "Swift package " + path + ": " + (error ?? "") }
-    listed
+  """
+  Why test discovery could not read this package, naming the file, or null.
+  """
+  discoveryFailure(ws: Workspace!): String {
+    let error = tool.discoveredTests(ws, path).error
+    if (error == "") { null } else { error }
   }
 
   """
   Compile this package for Linux with swift build.
+
+  A package whose tests could not be discovered fails here, rather than
+  stopping every check.
   """
   build(ws: Workspace!): Void @check {
+    let failure = discoveryFailure(ws)
+    if (failure != null) { raise "Swift package " + path + ": test discovery failed: " + (failure ?? "") }
     run(ws, "build")
   }
 
@@ -308,6 +387,71 @@ type SwiftPackage {
     if (error != null) { raise "Swift package " + path + ": " + (error ?? "") }
     null
   }
+
+  """
+  One swift test command and report shared by every selected test in this
+  package. It depends only on the selection, never on the calling check, so
+  every check in the package builds the same command and the engine runs it once.
+  """
+  let runTests(ws: Workspace!, selection: SwiftTests!): SwiftTestResults! {
+    let names = tool.sorted(selection.names.uniq)
+    if (names.length == 0) { raise "no tests selected in Swift package " + path }
+    let whole = selection.narrowed == false
+    let configured = if (whole) {
+      tool.testFlags
+    } else {
+      tool.withoutOptions(tool.testFlags, ["--filter", "--specifier", "-s"], [])
+        + ["--filter", tool.exactFilter(names)]
+    }
+    let flags = tool.withoutOptions(
+      configured,
+      ["--xunit-output", "--event-stream-output-path", "--event-stream-version"],
+      [],
+    )
+    # swift test builds the package first: a compile error is this run's to
+    # report, against the package's selected tests. Never raise here: a raise
+    # would fail every check identically.
+    let executed = container(ws).withExec(
+      ["swift", "test"] + flags + [
+        "--xunit-output", "/tmp/dagger-swift-test-xunit.xml",
+        "--event-stream-output-path", "/tmp/dagger-swift-test-events.jsonl",
+        "--event-stream-version", "0",
+      ],
+      expect: ReturnType.ANY,
+      redirectStdout: "/tmp/dagger-swift-test-stdout.log",
+      redirectStderr: "/tmp/dagger-swift-test-stderr.log",
+    )
+    # testFlags may exclude a selected test on purpose. Otherwise a selected
+    # test without a result fails as not run.
+    let options = tool.testFlags.map { flag => flag.split("=")[0] ?? "" }
+    let allowUnrun = options.contains("--skip")
+      or (whole and (options.contains("--filter") or options.contains("--specifier") or options.contains("-s")))
+    # Only post-processing needs root. The test command above keeps the custom
+    # base's configured user.
+    let indexed = executed
+      .withUser("0:0")
+      .withFile("/usr/local/bin/swift-tests", tool.helper)
+      .withNewFile("/tmp/dagger-swift-test-selection.json", JSON.encode({{
+        names,
+        allowUnrun
+      }}))
+      .withExec([
+        "/usr/local/bin/swift-tests",
+        "report",
+        "--selection", "/tmp/dagger-swift-test-selection.json",
+        "--stdout", "/tmp/dagger-swift-test-stdout.log",
+        "--stderr", "/tmp/dagger-swift-test-stderr.log",
+        "--events", "/tmp/dagger-swift-test-events.jsonl",
+        "--xunit", "/tmp/dagger-swift-test-xunit.xml",
+        "--exit-code", `${executed.exitCode}`,
+        "--output", "/tmp/dagger-swift-test-results",
+      ])
+    SwiftTestResults(
+      results: indexed.directory("/tmp/dagger-swift-test-results"),
+      names: names,
+      path: path,
+    )
+  }
 }
 
 """
@@ -315,7 +459,18 @@ Tests in a Swift package, keyed by the identifiers reported by SwiftPM.
 """
 type SwiftTests @collection {
   names: [String!]! @keys
-  let allNames: [String!]!
+
+  """
+  Tests selected in or out since the collection was discovered.
+  """
+  delta: CollectionDelta @delta
+
+  """
+  Whether the active selection removed tests from this collection. Without a
+  delta (a direct API call), the explicit filter is the safe choice.
+  """
+  narrowed: Boolean! { delta == null or delta!.removedKeys.length > 0 }
+
   let package: SwiftPackage!
 
   """
@@ -326,27 +481,17 @@ type SwiftTests @collection {
   }
 
   """
-  Run selected tests together. A narrowed selection overrides testFlags' filter
-  or specifier; skip flags still apply. An empty selection runs nothing.
+  Run these tests in one swift test invocation and report every failing test.
+  A narrowed selection overrides testFlags' filter or specifier; skip flags
+  still apply. An empty selection runs nothing. A plain helper: each test has
+  its own check.
   """
-  test(ws: Workspace!): Void @check {
-    run(ws, names, names != allNames)
-  }
-
-  let run(ws: Workspace!, selected: [String!]!, filtered: Boolean!): Void {
-    if (selected.length > 0) {
-      let tool = package.tool
-      let flags = if (filtered) {
-        tool.withoutOptions(tool.testFlags, ["--filter", "--specifier", "-s"], [])
-          + ["--filter", tool.exactFilter(selected)]
-      } else {
-        tool.testFlags
+  test(ws: Workspace!): Void {
+    if (names.length > 0) {
+      let failures = package.runTests(ws, self).failures
+      if (failures.length > 0) {
+        raise "Swift package " + package.path + ": " + `${failures.length}` + " failed:\n" + failures.join("\n")
       }
-      # Reuse discovery's compiled artifacts. SwiftPM still checks whether the
-      # execution flags require rebuilding (for example, code coverage).
-      let ran = package.discovered(ws).withExec(["swift", "test"] + flags, expect: ReturnType.ANY)
-      let error = tool.commandFailure(ran, "swift test")
-      if (error != null) { raise "Swift package " + package.path + ": " + (error ?? "") }
     }
     null
   }
@@ -361,8 +506,36 @@ type SwiftTest {
 
   """
   Run this test, or all cases of this parameterized test function.
+
+  Every selected test in the package shares one swift test run.
   """
-  test(ws: Workspace!): Void @check {
-    suite.run(ws, [name], true)
+  test(ws: Workspace!, selection: SwiftTests!): Void @check {
+    if (selection.package.path != suite.package.path) {
+      raise "Swift test selection belongs to package " + selection.package.path + ", not " + suite.package.path
+    }
+    selection.package.runTests(ws, selection).assertPassed(name)
+  }
+}
+
+# The shared indexer keeps each result small, regardless of total report size.
+type SwiftTestResults {
+  let results: Directory!
+  # The selection, sorted in byte order. A result file is named by its rank.
+  let names: [String!]!
+  let path: String!
+
+  let failure(name: String!): String! {
+    if (names.contains(name) == false) { raise "Swift test is outside the selection: " + name }
+    results.file(`${names.filter { other => other < name }.length}`).contents
+  }
+
+  let assertPassed(name: String!): Void {
+    let message = failure(name)
+    if (message != "") { raise "Swift package " + path + ": " + message }
+    null
+  }
+
+  let failures: [String!]! {
+    names.map { name => failure(name) }.filter { message => message != "" }
   }
 }

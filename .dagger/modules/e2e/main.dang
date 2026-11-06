@@ -18,6 +18,12 @@ type E2e {
     }
   }
 
+  # Run one test check directly with just that test selected. Direct calls do
+  # not apply the engine's filtered view, so the selection is passed explicitly.
+  let testCheck(ws: Workspace!, tests: SwiftTests!, name: String!): Check! {
+    tests.get(key: name).test(ws, selection: tests.subset(keys: [name]))
+  }
+
   # Fixtures live in code so the module's own workspace contains no test packages
   # for automatic discovery, especially the deliberately broken ones.
   let fixture: Directory! {
@@ -81,7 +87,7 @@ type E2e {
     assert(escape == "rejected", "package path escaped workspace")
     let empty = directory.withNewFile("README.md", "No Swift packages").asWorkspace
     assert(swift.packages(empty).keys == [], "empty workspace discovered packages")
-    swift.packages(empty).batch.test(empty)
+    swift.packages(empty).test(empty)
     null
   }
 
@@ -192,24 +198,19 @@ type E2e {
     let tool = swift(packageExclude: ["mobile/ios/App/CapApp-SPM"])
     let packages = tool.packages(ws)
     assert(packages.keys == ["mobile/ios/App/HealthSignals"], "excluded package was listed")
-    run(packages.batch.build(ws))
-    run(
-      packages.get(key: "mobile/ios/App/HealthSignals").tests(ws).batch.test(ws),
-    )
-    packages.batch.test(ws)
+    packages.build(ws)
+    packages.get(key: "mobile/ios/App/HealthSignals").tests(ws).test(ws)
+    packages.test(ws)
     let included = swift(packageInclude: ["mobile/ios/App/HealthSignals"]).packages(ws)
     assert(included.keys == packages.keys, "explicit inclusion did not isolate the valid package")
-    run(included.batch.build(ws))
-    run(
-      included.get(key: "mobile/ios/App/HealthSignals").tests(ws).batch.test(ws),
-    )
-    included.batch.test(ws)
+    included.build(ws)
+    included.get(key: "mobile/ios/App/HealthSignals").tests(ws).test(ws)
+    included.test(ws)
     let explicit = tool.package(ws, "mobile/ios/App/CapApp-SPM")
     assert(failure(explicit.build(ws)).contains("missing-swift-dependency"), "explicit API did not attempt dependency resolution")
-    let error = { explicit.tests(ws).keys.join(","); "unexpected success" } rescue {
-      err: Error => err.message
-    }
-    assert(error.contains("missing-swift-dependency"), "broken fixture did not fail test discovery")
+    # Discovery reads the manifest as text: no dependency resolution, and
+    # this manifest declares no test targets.
+    assert(explicit.tests(ws).keys == [], "broken fixture listed tests")
     null
   }
 
@@ -224,12 +225,12 @@ type E2e {
     """).asWorkspace
     let package = swift.package(ws, ".")
     run(package.build(ws))
-    run(package.tests(ws).batch.test(ws))
+    package.tests(ws).test(ws)
     null
   }
 
   """
-  Selections isolate siblings; batch failures identify every failing package.
+  Selections isolate siblings; collection failures identify every failing package.
   """
   selectionAndFailures: Void @check {
     let broken = fixture.withNewFile("Tests/SignalsTests/SignalsTests.swift", """
@@ -245,12 +246,12 @@ type E2e {
       .asWorkspace
     let packages = swift.packages(ws)
     assert(packages.get(key: "passing").path == "passing", "collection get failed")
-    packages.subset(keys: ["passing"]).batch.test(ws)
-    packages.subset(keys: []).batch.test(ws)
-    let error = { packages.batch.test(ws); "unexpected success" } rescue {
+    packages.subset(keys: ["passing"]).test(ws)
+    packages.subset(keys: []).test(ws)
+    let error = { packages.test(ws); "unexpected success" } rescue {
       err: Error => err.message
     }
-    assert(error.contains("failing-a") and error.contains("failing-b"), "batch lost failures: " + error)
+    assert(error.contains("failing-a") and error.contains("failing-b"), "collection test lost failures: " + error)
     assert(error.contains("intentional test failure"), "test diagnostic was lost: " + error)
     assert(error.contains("- passing:") == false, "passing package reported as failed")
     let invalid = fixture.withNewFile("Sources/Signals/Signals.swift", "this is not Swift\n").asWorkspace
@@ -295,7 +296,7 @@ type E2e {
       .withNewFile("testdata/expected.txt", "42")
       .asWorkspace(cwd: "packages/app")
     let tool = swift(includeExtraFiles: ["packages/shared/**", "testdata/**"])
-    run(tool.package(ws, ".").tests(ws).batch.test(ws))
+    tool.package(ws, ".").tests(ws).test(ws)
     null
   }
 
@@ -330,7 +331,7 @@ type E2e {
     assert(files.contains("ignored.txt") == false, "gitignored file imported")
     assert(files.contains(".swiftpm/configuration/marker"), "SwiftPM configuration excluded")
     run(package.build(ws))
-    run(package.tests(ws).batch.test(ws))
+    package.tests(ws).test(ws)
     # The custom container must take precedence over an invalid image setting.
     let prepared = swift(
       baseImageAddress: "invalid.invalid/should-not-be-pulled",
@@ -392,26 +393,49 @@ type E2e {
       tests.get(key: "SignalsTests.modern()").name == "SignalsTests.modern()",
       "get lost identifier",
     )
-    run(tests.get(key: "SignalsTests.SignalsTests/testPass").test(ws))
-    run(tests.get(key: "SignalsTests.modern()").test(ws))
-    run(
-      tests.subset(keys: ["SignalsTests.Nested/nested()", "SignalsTests.parameters(value:)", "SignalsTests.modern()"]).batch.test(ws),
-    )
-    run(tests.subset(keys: []).batch.test(ws))
-    assert(failure(tests.batch.test(ws)).contains("sibling must not run"), "whole suite hid failures")
+    run(testCheck(ws, tests, "SignalsTests.SignalsTests/testPass"))
+    run(testCheck(ws, tests, "SignalsTests.modern()"))
+    tests.subset(keys: ["SignalsTests.Nested/nested()", "SignalsTests.parameters(value:)", "SignalsTests.modern()"]).test(ws)
+    tests.subset(keys: []).test(ws)
+    let whole = { tests.test(ws); "unexpected success" } rescue {
+      err: Error => err.message
+    }
     assert(
-      failure(tests.get(key: "SignalsTests.SignalsTests/testPassExtra").test(ws)).contains("XCTest sibling"),
+      whole.contains("XCTest sibling must not run") and whole.contains("Swift Testing sibling must not run"),
+      "whole suite hid failures: " + whole,
+    )
+    # With the whole collection as its selection, a passing test passes even
+    # though siblings in the same shared run fail.
+    run(
+      tests.get(key: "SignalsTests.SignalsTests/testPass").test(ws, selection: tests),
+    )
+    assert(
+      failure(testCheck(ws, tests, "SignalsTests.SignalsTests/testPassExtra")).contains("XCTest sibling"),
       "selected failing test passed",
     )
     assert(
-      failure(tests.get(key: "SignalsTests.modernExtra()").test(ws)).contains("Swift Testing sibling"),
+      failure(testCheck(ws, tests, "SignalsTests.modernExtra()")).contains("Swift Testing sibling"),
       "selected Swift Testing function did not run",
     )
+    let outside = failure(
+      tests.get(key: "SignalsTests.modern()").test(
+        ws,
+        selection: tests.subset(keys: ["SignalsTests.Nested/nested()"]),
+      ),
+    )
+    assert(outside.contains("outside the selection"), "test outside its selection ran: " + outside)
+    # Discovery compiles nothing, so invalid code still lists; the run reports
+    # the compiler's diagnostics against the package's tests.
     let invalid = fixture.withNewFile("Sources/Signals/Signals.swift", "not valid Swift\n").asWorkspace
-    let error = { swift.package(invalid, ".").tests(invalid).keys.join(",") } rescue {
+    let invalidTests = swift.package(invalid, ".").tests(invalid)
+    assert(invalidTests.keys == ["SignalsTests.SignalsTests/testAnswer"], "invalid code changed discovery")
+    let error = { invalidTests.test(invalid); "unexpected success" } rescue {
       err: Error => err.message
     }
-    assert(error.contains("swift test list failed"), "discovery hid compiler failure: " + error)
+    assert(
+      error.contains("swift test failed outside any test") and error.contains("not valid Swift"),
+      "run hid compiler failure: " + error,
+    )
     null
   }
 
@@ -427,9 +451,8 @@ type E2e {
       ],
     ).package(ws, ".").tests(ws)
     assert(tests.keys.contains("SignalsTests.conditional()"), "discovery lost compilation flags")
-    run(
-      tests.subset(keys: ["SignalsTests.SignalsTests/testPass", "SignalsTests.modern()"]).batch.test(ws),
-    )
+    # --parallel reports XCTest results through SwiftPM's xUnit file.
+    tests.subset(keys: ["SignalsTests.SignalsTests/testPass", "SignalsTests.modern()"]).test(ws)
     let wsParameters = selectable.withNewFile(
       "Tests/SignalsTests/ModernTests.swift",
       """
@@ -437,11 +460,383 @@ type E2e {
         @Test(arguments: [1, 2]) func parameters(value: Int) { #expect(value == 1) }
       """,
     ).asWorkspace
-    let selected = swift.package(wsParameters, ".").tests(wsParameters).get(key: "SignalsTests.parameters(value:)")
+    let parameterTests = swift.package(wsParameters, ".").tests(wsParameters)
     assert(
-      failure(selected.test(wsParameters)).contains("Expectation failed"),
+      failure(testCheck(wsParameters, parameterTests, "SignalsTests.parameters(value:)")).contains("Expectation failed"),
       "parameter cases were skipped",
     )
     null
+  }
+
+  """
+  Unit tests for the helper: the source scan and the report indexer.
+  """
+  helperTests(ws: Workspace!): Void @check {
+    container
+      .from("golang:1.27.3-alpine")
+      .withEnvVariable("CGO_ENABLED", "0")
+      .withEnvVariable("GOTOOLCHAIN", "local")
+      .withDirectory("/src", ws.directory("/swift/helpers/swift-tests"))
+      .withWorkdir("/src")
+      .withExec(["go", "vet", "./..."])
+      .withExec(["go", "test", "./..."])
+      .sync
+    null
+  }
+
+  # Only the unindented CHECKS header counts. Nested summaries can report
+  # correct test results even when Dagger attributes the checks incorrectly.
+  let checkSummaryMatches(output: String!, passed: Int!, failed: Int!): Boolean! {
+    let headers = output.split("\n").filter { line =>
+      line.hasPrefix("CHECKS ") or line.hasPrefix("== CHECKS ==")
+    }
+    let expected = (if (failed > 0) { ["✘", toString(failed), "failed"] } else { [] })
+      + (if (passed > 0) { ["✔", toString(passed), "passed"] } else { [] })
+    headers.length == 1 and headers[0]!
+      .trimPrefix("== ")
+      .trimPrefix("CHECKS")
+      .trimPrefix(" ==")
+      .trimSpace
+      .split(" ")
+      .filter { word => word != "" } == expected
+  }
+
+  """
+  The CLI summary parser counts top-level checks only.
+  """
+  selectedSummary: Void @check {
+    let wrong = "CHECKS  ✘ 8 failed\n  TESTS\n    ✘ 1 failed\n    ✔ 7 passed\n"
+    assert(checkSummaryMatches(wrong, 7, 1) == false, "nested counts hid failed checks")
+    assert(checkSummaryMatches(wrong, 0, 8), "zero passing checks were not recognized")
+    assert(checkSummaryMatches("CHECKS  ✔ 18 passed\n", 8, 0) == false, "accepted a partial count")
+    assert(checkSummaryMatches("CHECKS  ✘ 1 failed  ✔ 7 passed\n", 7, 1), "mixed counts were not recognized")
+    assert(checkSummaryMatches("== CHECKS ==  ✔ 8 passed\n", 8, 0), "agent report was not recognized")
+    assert(checkSummaryMatches("  CHECKS  ✔ 8 passed\n", 8, 0) == false, "accepted a nested header")
+    null
+  }
+
+  # Exercise selection through the CLI: direct Dang calls do not apply the
+  # engine's filtered collection view. The engine supplies its matching CLI.
+  let selectedRun(
+    ws: Workspace!,
+    fixture: Directory!,
+    args: [String!]!,
+    settings: String! = "",
+    cli: [String!]! = ["--progress=report", "check", "--check=test"],
+  ): Container! {
+    container
+      .from("alpine:3.23")
+      .withEnvVariable("NO_COLOR", "1")
+      .withDirectory("/source", ws.directory("/swift"))
+      .withDirectory("/work", fixture)
+      .withNewFile("/work/.git/HEAD", "ref: refs/heads/main\n")
+      .withNewFile("/work/dagger.toml", "[modules.swift]\nsource = \"/source\"\n" + settings)
+      .withWorkdir("/work")
+      .withExec(
+        ["/dev/.dagger/dagger"] + cli + args,
+        expect: ANY,
+        daggerInDaggerNewSession: true,
+      )
+  }
+
+  let selectedCheck(
+    ws: Workspace!,
+    fixture: Directory!,
+    args: [String!]!,
+    passed: Int!,
+    failed: Int! = 0,
+    messages: [String!]! = [],
+    absent: [String!]! = [],
+    settings: String! = "",
+  ): Void {
+    let result = selectedRun(ws, fixture, args, settings: settings)
+    let output = result.stdout + result.stderr
+    assert((result.exitCode == 0) == (failed == 0), "unexpected check exit status:\n" + output)
+    assert(checkSummaryMatches(output, passed, failed), "unexpected Dagger check totals:\n" + output)
+    messages.map { message =>
+      assert(output.contains(message), "missing " + message + ":\n" + output)
+    }
+    absent.map { message =>
+      assert(output.contains(message) == false, "unexpected " + message + ":\n" + output)
+    }
+    null
+  }
+
+  # A package with an XCTest class (SelectionCases, unlike its module name)
+  # and Swift Testing functions. The "other" tests fail if they ever run.
+  let selectionPackage(xctest: String! = "", modern: String! = ""): Directory! {
+    directory
+      .withNewFile("Package.swift", """
+        // swift-tools-version: 5.9
+        import PackageDescription
+        let package = Package(
+            name: "Selection",
+            targets: [.testTarget(name: "SelectionTests")]
+        )
+      """)
+      .withNewFile("Tests/SelectionTests/Cases.swift", """
+        import Foundation
+        import XCTest
+        final class SelectionCases: XCTestCase {
+            func testFoo() { XCTAssertEqual(2 + 2, 4) }
+            func testBar() { XCTAssertEqual(2 + 2, 4) }
+            func testOther() { XCTFail("excluded test ran") }
+        }
+      """ + "\n" + xctest)
+      .withNewFile("Tests/SelectionTests/Modern.swift", """
+        import Testing
+        @Test func foo() { #expect(2 + 2 == 4) }
+        @Test func bar() { #expect(2 + 2 == 4) }
+        @Test func other() { Issue.record("excluded test ran") }
+      """ + "\n" + modern)
+  }
+
+  let selectionFixture: Directory! {
+    directory
+      .withDirectory("one", selectionPackage)
+      .withDirectory("two", selectionPackage)
+  }
+
+  let selectionArgs: [String!]! {
+    ["one", "two"].map { pkg => "--swift-package=" + pkg }
+      + [
+        "SelectionTests.SelectionCases/testFoo",
+        "SelectionTests.SelectionCases/testBar",
+        "SelectionTests.foo()",
+        "SelectionTests.bar()",
+      ].map { name => "--swift-test=" + name }
+  }
+
+  """
+  Selected XCTest and Swift Testing checks pass in several packages.
+
+  Excluded siblings never run, or every check sharing their run would fail.
+  """
+  selectedTests(ws: Workspace!): Void @check {
+    selectedCheck(ws, selectionFixture, selectionArgs, passed: 8, absent: ["excluded test ran"])
+  }
+
+  """
+  A failing selected test fails only its own check.
+  """
+  selectedFailure(ws: Workspace!): Void @check {
+    let fixture = selectionFixture.withDirectory(
+      "one",
+      selectionPackage(modern: "@Test func failing() { Issue.record(\"selected failure\") }\n"),
+    )
+    selectedCheck(
+      ws,
+      fixture,
+      selectionArgs.filter { arg => arg != "--swift-test=SelectionTests.bar()" } + [
+        "--swift-test=SelectionTests.failing()",
+      ],
+      passed: 6,
+      failed: 1,
+      messages: ["selected failure"],
+      absent: ["excluded test ran"],
+    )
+  }
+
+  """
+  A Swift Testing suite whose setup throws fails its own selected tests only.
+  """
+  selectedSetupFailure(ws: Workspace!): Void @check {
+    let fixture = selectionFixture.withDirectory(
+      "one",
+      selectionPackage(modern: """
+        struct SetupError: Error {}
+        @Suite struct Setup {
+            init() throws { throw SetupError() }
+            @Test func first() {}
+            @Test func second() {}
+        }
+      """),
+    )
+    selectedCheck(
+      ws,
+      fixture,
+      selectionArgs + ["--swift-test=SelectionTests.Setup/first()", "--swift-test=SelectionTests.Setup/second()"],
+      passed: 8,
+      failed: 2,
+      messages: ["SetupError"],
+    )
+  }
+
+  """
+  A failure no selected test owns fails every check sharing the package's run.
+
+  Here the XCTest process exits non-zero after every test passed.
+  """
+  selectedTeardownFailure(ws: Workspace!): Void @check {
+    let fixture = selectionFixture.withDirectory(
+      "one",
+      selectionPackage(xctest: """
+        final class Teardown: XCTestCase {
+            func testRegister() { atexit { _exit(3) } }
+        }
+      """),
+    )
+    selectedCheck(
+      ws,
+      fixture,
+      selectionArgs + ["--swift-test=SelectionTests.Teardown/testRegister"],
+      passed: 4,
+      failed: 5,
+      messages: ["swift test failed outside any test"],
+    )
+  }
+
+  """
+  A selected test with no result fails, even when swift test exits zero.
+  """
+  selectedNeverRan(ws: Workspace!): Void @check {
+    # XCTest runs a class's tests in name order; exiting stops the rest.
+    let fixture = directory.withDirectory(
+      "one",
+      selectionPackage(xctest: """
+        final class Quit: XCTestCase {
+            func testAQuit() { exit(0) }
+            func testBAfter() {}
+        }
+      """),
+    )
+    selectedCheck(
+      ws,
+      fixture,
+      [
+        "--swift-test=SelectionTests.Quit/testAQuit",
+        "--swift-test=SelectionTests.Quit/testBAfter",
+        "--swift-test=SelectionTests.foo()",
+      ],
+      passed: 1,
+      failed: 2,
+      messages: ["SelectionTests.Quit/testAQuit did not finish", "SelectionTests.Quit/testBAfter did not run"],
+    )
+  }
+
+  """
+  A package whose code does not compile fails its own selected tests.
+
+  The compiler's diagnostics come from the shared run; other packages pass.
+  """
+  selectedBuildFailure(ws: Workspace!): Void @check {
+    let fixture = selectionFixture.withDirectory(
+      "two",
+      selectionPackage(modern: "@Test func broken() { undefinedSymbol() }\n"),
+    )
+    selectedCheck(
+      ws,
+      fixture,
+      selectionArgs + ["--swift-test=SelectionTests.broken()"],
+      passed: 4,
+      failed: 5,
+      messages: ["Swift package two: swift test failed outside any test", "undefinedSymbol"],
+    )
+  }
+
+  # Distinct span IDs of the plain progress lines naming an operation.
+  let spans(output: String!, operation: String!): [String!]! {
+    output
+      .split("\n")
+      .filter { line => line.contains(operation) }
+      .map { line => (line.split(" : ")[0] ?? "").trimSpace }
+      .uniq
+  }
+
+  """
+  Eight selected tests in two packages run one swift test and report per package.
+  """
+  selectedOneRunPerPackage(ws: Workspace!): Void @check {
+    # Its own fixture, so the counted runs are this check's own.
+    let fixture = selectionFixture.withNewFile(
+      "one/Tests/SelectionTests/Count.swift",
+      "// one run\n",
+    )
+    let result = selectedRun(
+      ws,
+      fixture,
+      selectionArgs,
+      cli: ["--progress=plain", "-vvv", "check", "--check=test"],
+    )
+    let output = result.stdout + result.stderr
+    assert(result.exitCode == 0, "selected tests failed:\n" + output)
+    let runs = spans(output, "withExec swift test --filter")
+    let reports = spans(output, "withExec /usr/local/bin/swift-tests report")
+    assert(runs.length == 2, "expected one swift test per package, saw " + toString(runs.length) + ":\n" + output)
+    assert(reports.length == 2, "expected one report per package, saw " + toString(reports.length) + ":\n" + output)
+    null
+  }
+
+  """
+  Listing runs no Swift tooling: broken code and an unpullable image still list.
+  """
+  selectedListing(ws: Workspace!): Void @check {
+    let fixture = selectionFixture.withDirectory(
+      "two",
+      selectionPackage(modern: "@Test func broken() { undefinedSymbol() }\n")
+        .withNewFile("Package.swift", """
+          // swift-tools-version: 5.9
+          import PackageDescription
+          let package = Package(
+              name: "Selection",
+              dependencies: [.package(url: "file:///missing-swift-dependency", from: "1.0.0")],
+              targets: [.testTarget(name: "SelectionTests")]
+          )
+        """),
+    )
+    let result = selectedRun(
+      ws,
+      fixture,
+      [],
+      cli: ["--progress=plain", "-vvv", "check", "-l", "--all"],
+      settings: "\n[modules.swift.settings]\nbaseImageAddress = \"invalid.invalid/should-not-be-pulled\"\n",
+    )
+    let output = result.stdout + result.stderr
+    assert(result.exitCode == 0, "listing failed:\n" + output)
+    [
+      "SelectionTests.SelectionCases/testOther",
+      "SelectionTests.broken()",
+      "SelectionTests.other()",
+    ].map { name =>
+      assert(
+        output.split("\n").filter { line => line.contains(name) and line.contains(" two ") }.length > 0,
+        "missing " + name + ":\n" + output,
+      )
+    }
+    assert(spans(output, "withExec swift ").length == 0, "listing ran Swift:\n" + output)
+    # The image appears in the settings span; it must never be pulled.
+    let pulls = output.split("\n").filter { line =>
+      line.contains("invalid.invalid") and line.contains("legacyWorkspaceConfigJson") == false
+    }
+    assert(pulls.length == 0, "listing pulled the Swift image:\n" + output)
+    null
+  }
+
+  """
+  A package with no tests removed runs whole; each failure stays with its check.
+  """
+  selectedWholePackage(ws: Workspace!): Void @check {
+    selectedCheck(
+      ws,
+      selectionFixture,
+      ["--swift-package=one"],
+      passed: 4,
+      failed: 2,
+      messages: ["SelectionTests.SelectionCases/testOther failed", "SelectionTests.other() failed"],
+    )
+  }
+
+  """
+  Tests that testFlags skip on purpose are not reported as never run.
+  """
+  selectedSkipFlags(ws: Workspace!): Void @check {
+    selectedCheck(
+      ws,
+      selectionFixture,
+      ["--swift-package=one"],
+      passed: 6,
+      absent: ["excluded test ran"],
+      settings: "\n[modules.swift.settings]\ntestFlags = [\"--skip\", \"[Oo]ther\"]\n",
+    )
   }
 }

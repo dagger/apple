@@ -6,7 +6,7 @@ Reusable Dagger modules for Apple development workflows.
 | --- | --- |
 | [Swift](swift/README.md) | Build and test cross-platform Swift packages in Linux containers. |
 
-Requires Dagger v1.0.0-beta.21.
+Requires Dagger v1.0.0-beta.22 or later.
 
 ```sh
 dagger install github.com/dagger/apple/swift
